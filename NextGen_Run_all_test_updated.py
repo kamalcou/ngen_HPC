@@ -4,7 +4,7 @@ import json
 import shutil
 import logging
 import argparse
-import shlex
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -34,16 +34,6 @@ parser.add_argument("--download",        action="store_true", help="Run preproce
 parser.add_argument("--run",             action="store_true", help="Run the NGIAB model + routing")
 parser.add_argument("--evaluate",        action="store_true", help="Run TEEHR evaluation")
 parser.add_argument("--all",             action="store_true", help="Run all steps")
-parser.add_argument("--data-root",       type=str,
-                    default=os.environ.get("NGIAB_DATA_ROOT", str(Path.home() / "ngiab_preprocess_output")),
-                    help="Directory containing per-gage preprocessed data (default: $NGIAB_DATA_ROOT or ~/ngiab_preprocess_output)")
-parser.add_argument("--container-runtime", type=str, choices=["auto", "docker", "singularity"],
-                    default=os.environ.get("NGIAB_CONTAINER_RUNTIME", "auto"),
-                    help="Container runtime to use for the ngen image (default: auto-detect — "
-                         "singularity/apptainer on HPC, docker on a MacBook/workstation)")
-parser.add_argument("--image-name",      type=str, default=None,
-                    help="Container image reference. Defaults to 'ngen_noaa_latest.sif' for singularity "
-                         "or 'awiciroh/ciroh-ngen-image:latest' for docker.")
 args = parser.parse_args()
 
 if args.all:
@@ -59,80 +49,15 @@ end_date        = pd.to_datetime(args.end_date)
 #precip_sources  = args.precip_sources
 #spatial_agg = args.spatial_agg
 
-host_data_path  = Path(args.data_root).expanduser() / hydrofabric_id
+data_root       = Path(os.environ.get("NGIAB_DATA_DIR", "/home/mhchowdhury/ngiab_preprocess_output"))
+host_data_path  = data_root / hydrofabric_id
 num_cpus        = int(os.environ.get("SLURM_NTASKS", os.cpu_count()))
 
-
-def detect_container_runtime(requested: str) -> str:
-    """Pick docker or singularity/apptainer. 'auto' prefers singularity on HPC
-    (module-loaded Apptainer) and falls back to docker (e.g. Docker Desktop on a Mac)."""
-    if requested != "auto":
-        if shutil.which(requested) is None:
-            raise RuntimeError(f"Requested container runtime '{requested}' not found on PATH.")
-        return requested
-
-    for candidate in ("singularity", "apptainer"):
-        if shutil.which(candidate):
-            return candidate
-    if shutil.which("docker"):
-        return "docker"
-    raise RuntimeError("No container runtime found. Install Docker (e.g. Docker Desktop on macOS) "
-                       "or Singularity/Apptainer (on HPC).")
-
-
-container_runtime = detect_container_runtime(args.container_runtime)
-# Apptainer is a drop-in CLI-compatible fork of Singularity; treat them the same.
-using_singularity  = container_runtime in ("singularity", "apptainer")
-
-if args.image_name:
-    image_name = args.image_name
-elif using_singularity:
-    image_name = "ngen_noaa_latest.sif"
-else:
-    image_name = "awiciroh/ciroh-ngen-image:latest"
-
-logger.info(f"Using container runtime: {container_runtime} (image: {image_name})")
-
-
-def container_exec(bind_path: Path, workdir: str, command: str) -> str:
-    """Build a shell command that execs `command` inside the ngen container,
-    binding bind_path to both /ngen/ngen/data and /workspace."""
-    if using_singularity:
-        return (
-            f"{container_runtime} exec "
-            f"--bind {bind_path}:/ngen/ngen/data "
-            f"--bind {bind_path}:/workspace "
-            f"--pwd {workdir} "
-            f"{image_name} {command}"
-        )
-    # The image's ENTRYPOINT (HelloNGEN.sh) intercepts `docker run image <args>` and
-    # treats <args> as its own CLI, not a command to exec — unlike `singularity exec`,
-    # which bypasses entrypoints entirely. Override the entrypoint with bash to run
-    # an arbitrary command instead.
-    return (
-        f"docker run --rm "
-        f"-v {shlex.quote(str(bind_path))}:/ngen/ngen/data "
-        f"-v {shlex.quote(str(bind_path))}:/workspace "
-        f"-w {workdir} "
-        f"--entrypoint /bin/bash "
-        f"{image_name} -c {shlex.quote(command)}"
-    )
-
-
-def container_run(bind_path: Path, entrypoint_args: str) -> str:
-    """Build a shell command that runs the ngen container's default entrypoint
-    (used for the actual model run), binding bind_path to /ngen/ngen/data."""
-    if using_singularity:
-        return (
-            f"{container_runtime} run "
-            f"--bind {bind_path}:/ngen/ngen/data "
-            f"{image_name} {entrypoint_args}"
-        )
-    return (
-        f"docker run --rm "
-        f"-v {shlex.quote(str(bind_path))}:/ngen/ngen/data "
-        f"{image_name} {entrypoint_args}"
-    )
+# ── Container runtime (Docker) ─────────────────────────────────
+DOCKER_CMD      = "docker"
+NGEN_IMAGE_NAME = "docker.io/awiciroh/ciroh-ngen-image"
+NGEN_IMAGE_TAG  = "latest"
+image_name      = f"{NGEN_IMAGE_NAME}:{NGEN_IMAGE_TAG}"
 
 TEEHR_DIR       = host_data_path / "teehr"
 CACHE_DIR       = TEEHR_DIR / "cache"
@@ -208,18 +133,20 @@ def update_realization(realization_path: Path, start_date: str, end_date: str, y
     logger.info(f"Updated realization.json")
 
 
-def generate_partitions(host_data_path: Path, num_cpus: int, hydrofabric_id: str) -> int:
+def generate_partitions(host_data_path: Path, image_name: str, num_cpus: int, hydrofabric_id: str) -> int:
     """Generate local partitions file and return actual number of partitions created."""
     logger.info(f"Generating partitions for {num_cpus} CPUs...")
 
-    cmd = container_exec(
-        host_data_path,
-        "/workspace",
-        f"python /dmod/utils/partitioning/local_only_partitions.py "
-        f"./config/{hydrofabric_id}_subset.gpkg {num_cpus} .",
-    )
     result = subprocess.run(
-        cmd,
+        f"""{DOCKER_CMD} run --rm \
+        -v {host_data_path}:/ngen/ngen/data \
+        -v {host_data_path}:/workspace \
+        -w /workspace \
+        --entrypoint python \
+        {image_name} \
+        /dmod/utils/partitioning/local_only_partitions.py \
+        ./config/{hydrofabric_id}_subset.gpkg \
+        {num_cpus} .""",
         shell=True,
         executable="/bin/bash",
         capture_output=True,
@@ -251,11 +178,19 @@ def move_outputs(host_data_path: Path, tag: str = None):
     dst_ngen.mkdir(parents=True, exist_ok=True)
     dst_troute.mkdir(parents=True, exist_ok=True)
 
+    existing_ngen = dst_ngen / "ngen"
+    if existing_ngen.exists():
+        shutil.rmtree(existing_ngen)
+
     if src_ngen.exists():
         shutil.move(str(src_ngen), str(dst_ngen))
         logger.info(f"Moved outputs/ngen → outputs/{tag}/ngen")
     else:
         logger.warning(f"outputs/ngen not found, skipping move.")
+
+    existing_troute = dst_troute / "troute"
+    if existing_troute.exists():
+        shutil.rmtree(existing_troute)
 
     if src_troute.exists():
         shutil.move(str(src_troute), str(dst_troute))
@@ -267,30 +202,25 @@ def move_outputs(host_data_path: Path, tag: str = None):
 # ── Step 1: Download / Preprocessing ──────────────────────────
 if args.download:
     logger.info(f"Step 1: Preprocessing for {hydrofabric_id}...")
+    download_start = time.time()
 
     ok = run_command(
         f"source .venv/bin/activate && yes y | uvx ngiab-prep -i {hydrofabric_id} -sfr "
-        f"--start '{start_date}' --end '{end_date}' --source aorc",
+        f"--start '{start_date:%Y-%m-%d}' --end '{end_date:%Y-%m-%d}' --source aorc",
         step="Preprocessing"
     )
     if not ok:
         exit(1)
 
-    logger.info("Preprocessing complete.")
+    logger.info(f"Preprocessing complete for {hydrofabric_id} in {time.time() - download_start:.1f}s")
 
 
 # ── Step 2: Run Model + Routing ────────────────────────────────
 if args.run:
-    forcings_file = host_data_path / "forcings" / "forcings.nc"
-    if not forcings_file.exists():
-        logger.error(
-            f"{forcings_file} not found — the --download step hasn't completed for "
-            f"{hydrofabric_id} yet. Re-run with --download first and let it finish."
-        )
-        exit(1)
+    run_start = time.time()
 
     # Generate partitions once per gage before the config loop
-    num_partitions = generate_partitions(host_data_path, num_cpus, hydrofabric_id)
+    num_partitions = generate_partitions(host_data_path, image_name, num_cpus, hydrofabric_id)
     if num_partitions == 0:
         logger.error("Aborting — partition generation failed.")
         exit(1)
@@ -298,7 +228,7 @@ if args.run:
     #for precip_source in precip_sources:
     #    for config in CONFIGS:
     #tag = f"{precip_source}_{config}"
-    tag = f"test_mac"
+    tag = f"test_jetstream2"
     #logger.info(f"── Running config: {tag} ──")
 
     # 2a. Update realization.json with correct forcing path
@@ -312,11 +242,12 @@ if args.run:
     troute_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Created outputs directory: {outputs_dir}")
 
-    # 2b. Run ngen via the container's default entrypoint in auto mode
+    # 2b. Run ngen via Singularity runscript in auto mode
     # auto {num_partitions} local → uses local_only_partitions, finds existing partitions file
     logger.info(f"Running ngen [{tag}]...")
     ok = run_command(
-                container_run(host_data_path, f"/ngen/ngen/data auto {num_partitions} local"),
+                f"{DOCKER_CMD} run --rm -v /local:/local -v {host_data_path}:/ngen/ngen/data "
+                f"{image_name} /ngen/ngen/data auto {num_partitions}  local",
                 step=f"ngen [{tag}]"
     )
     if not ok:
@@ -336,4 +267,4 @@ if args.run:
             # 2d. Move outputs to config-specific folders
     move_outputs(host_data_path, tag)
 
-    logger.info("All model runs complete.")
+    logger.info(f"All model runs complete for {hydrofabric_id} in {time.time() - run_start:.1f}s")
