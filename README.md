@@ -1,4 +1,4 @@
-# ngen_testbed
+# ngen_HPC
 
 Scripts for running the [NOAA NextGen (NGEN)](https://github.com/NOAA-OWP/ngen) water model
 end-to-end for a set of USGS gages: preprocess forcing/hydrofabric data with
